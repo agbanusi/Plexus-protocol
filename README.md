@@ -6,10 +6,32 @@ Every instant-redemption design in production today makes the same trade: to pro
 
 Plexus breaks that one-to-one. Every vault is itself an ERC4626 over the same base asset, so **vaults allocate into each other**. One pool of stables can sit behind a dozen redemption desks at once, backstopping each of them, and earn yield at the leaves while it waits. The spike in one vault is absorbed by capital that's idle in another — which is exactly the capital you'd otherwise be paying to keep still.
 
-```
-Vault A ──50%──> Vault B ──40%──> Vault D
-    ├───30%────> Vault C ──30%──> Morpho vault
-    └───20%────> Morpho vault
+```mermaid
+flowchart LR
+    LP(["LP"]) -->|deposits stables| A
+
+    A["Vault A<br/>base + RWA-A"]
+    B["Vault B<br/>base + RWA-B"]
+    C["Vault C<br/>base + RWA-C"]
+    D["Vault D<br/>base + RWA-D"]
+    M1[("Morpho<br/>vault")]
+    M2[("Morpho<br/>vault")]
+
+    A -->|50%| B
+    A -->|30%| C
+    A -->|20%| M1
+    B -->|40%| D
+    C -->|30%| M2
+
+    H(["RWA-B holder"]) -.->|"1 · redeemRwa"| B
+    B -.->|"2 · stables out, now"| H
+
+    classDef vault fill:#2563eb,stroke:#1e40af,color:#fff
+    classDef venue fill:#0f766e,stroke:#115e59,color:#fff
+    classDef actor fill:#e2e8f0,stroke:#64748b,color:#0f172a
+    class A,B,C,D vault
+    class M1,M2 venue
+    class LP,H actor
 ```
 
 A holder redeems against vault B. B has no idle stables of its own — it pulls from Morpho, holding liquidity that came in as an LP deposit into A. B's fee accrues to B's shares, which A owns, so the yield flows back up to A's LPs. **The same dollar underwrites redemptions at every level of that graph, and earns yield at the bottom of it.**
@@ -61,6 +83,36 @@ The result is an open market for immediacy: anyone can bring an asset, anyone ca
 
 The core component is the `Vault`, which pairs one base asset with exactly one RWA and manages LP positions, allocation, and redemption.
 
+```mermaid
+flowchart TB
+    subgraph V ["Vault  (one per RWA)"]
+        direction LR
+        E["ERC4626<br/>LP shares over the base asset"]
+        AL["Allocator (inherited)<br/>targets · absoluteCap · relativeCap"]
+    end
+
+    O["Oracle<br/>price() → RWA in base, 1e18"]
+    PF[["Chainlink-style<br/>price feed"]]
+    R{{"Redeemer<br/>issuer-specific, set at onboarding"}}
+    T1["Vault B<br/>another Plexus vault"]
+    T2[("Morpho vault<br/>or any ERC4626")]
+
+    V -->|"marks RWA"| O
+    O --> PF
+    V -->|"externalRedeem · finalizeExternalRedeem"| R
+    AL -->|allocate / deallocate| T1
+    AL -->|allocate / deallocate| T2
+
+    classDef core fill:#2563eb,stroke:#1e40af,color:#fff
+    classDef ext fill:#0f766e,stroke:#115e59,color:#fff
+    classDef out fill:#b45309,stroke:#92400e,color:#fff
+    class E,AL core
+    class T1,T2 ext
+    class O,PF,R out
+```
+
+Everything outside the vault is swappable per asset: the oracle, the redeemer, and the set of allocation targets. That is what lets a curator onboard a new asset without touching another vault's code.
+
 - **Vault**: An ERC4626 over a base asset (a stable), paired with exactly one RWA. LPs deposit the base asset and receive shares; RWA holders swap into the base asset instantly. Inherits `Allocator`.
 - **Allocator**: The allocation layer every vault inherits. Pushes idle base asset into external ERC4626 targets under per-target caps. Targets are ERC4626 over the same base asset, so there is no adapter layer.
 - **Oracle**: Wraps one Chainlink-style feed. Deployed per vault, and reports the price of one whole RWA in the base asset, scaled to 1e18.
@@ -84,7 +136,32 @@ Depth has costs: `totalAssets()` fans out across the graph on every deposit, wit
 
 ### Cycle Safety
 
-A vault must never be reachable from itself (`A -> B -> A`). `totalAssets()` reads through to each target, so a cycle makes it recurse with no base case until it exhausts gas — which would brick every vault on the loop, taking deposits, withdrawals, redemptions and allocation with it. This is a property of the *edge*, not of the amounts: a 0% cap with nothing allocated recurses exactly like a 50% one, because `totalAllocated()` previews every registered target regardless of balance.
+A vault must never be reachable from itself (`A -> B -> A`). `totalAssets()` reads through to each target, so a cycle makes it recurse with no base case until it exhausts gas — which would brick every vault on the loop, taking deposits, withdrawals, redemptions and allocation with it.
+
+```mermaid
+flowchart LR
+    subgraph ok ["✅ allowed — a diamond is not a cycle"]
+        direction LR
+        A1["Vault A"] --> B1["Vault B"]
+        A1 --> C1["Vault C"]
+        B1 --> M1[("Morpho")]
+        C1 --> M1
+    end
+
+    subgraph bad ["❌ rejected — setCaps reverts"]
+        direction LR
+        A2["Vault A"] -->|allocates| B2["Vault B"]
+        B2 -.->|"setCaps(A) ✗"| A2
+    end
+```
+
+This is a property of the *edge*, not of the amounts. `totalAssets()` on a loop expands forever rather than converging on anything:
+
+```
+A.totalAssets() → B.previewRedeem() → B.totalAssets() → A.previewRedeem() → A.totalAssets() → …
+```
+
+A 0% cap with nothing allocated recurses exactly like a 50% one, because `totalAllocated()` previews every registered target regardless of balance.
 
 Two mechanisms prevent it:
 
@@ -122,6 +199,27 @@ Withdrawals are single-step. The user calls `withdraw(assets, receiver, owner)` 
 
 The protocol's purpose: an RWA holder exits to the base asset immediately rather than waiting on the issuer.
 
+```mermaid
+sequenceDiagram
+    autonumber
+    actor H as RWA holder
+    participant V as Vault
+    participant O as Oracle
+    participant T as Liquidity target
+
+    H->>V: redeemRwa(rwaAmount, minBaseOut)
+    V->>O: price()
+    O-->>V: RWA price, 1e18
+    Note over V: value = rwaValue(rwaAmount)<br/>baseOut = value − redemptionFee<br/>check rwaCap, check minBaseOut
+    H->>V: RWA in
+    opt local idle is short
+        V->>T: withdraw the shortfall
+        T-->>V: base asset
+    end
+    V->>H: base asset out
+    Note over V: vault now holds RWA worth<br/>more than the base it paid
+```
+
 1. The holder calls `redeemRwa(rwaAmount, minBaseOut)`.
 2. The vault values the RWA at the oracle price and applies `redemptionFee`. `previewRedeemRwa` quotes this off-chain.
 3. The total RWA exposure is checked against `rwaCap`, and the payout against `minBaseOut`.
@@ -132,6 +230,30 @@ The fee is what LPs earn: the vault takes on RWA worth more than the base it pay
 ### External Settlement
 
 The RWA accumulates on the vault's books until the owner settles it back to the base asset through the vault's redeemer. Settlement is issuer-specific and not atomic, so the owner supplies the calldata and the call target is pinned to `redeemer`.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Own as Owner
+    participant V as Vault
+    participant R as Redeemer / issuer
+    participant T as Liquidity target
+
+    Own->>V: externalRedeem(data, value)
+    V->>R: approve RWA, then call with owner calldata
+    R-->>V: pulls the RWA
+    Note over V: rwaInRedemption += rwaIn<br/>still marked in totalAssets,<br/>so the share price does not move
+
+    rect rgb(245, 240, 225)
+        Note over R: off-chain settlement — days, not blocks
+    end
+
+    Own->>V: finalizeExternalRedeem(rwaAmount, data, value)
+    V->>R: call with owner calldata
+    R-->>V: base asset in
+    V->>V: rwaInRedemption −= rwaAmount
+    V->>T: allocate the proceeds
+```
 
 1. **`externalRedeem(data, value)`**: Approves the vault's RWA balance to the redeemer and calls it. The RWA that leaves is booked as `rwaInRedemption` and still counts toward `totalAssets` and `rwaExposure`, so the share price does not move.
 2. **`finalizeExternalRedeem(rwaAmount, data, value)`**: Calls the redeemer to collect the base asset, clears `rwaAmount` from `rwaInRedemption`, and allocates the proceeds to the liquidity target.
