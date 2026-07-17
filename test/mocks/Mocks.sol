@@ -82,3 +82,33 @@ contract MockRedeemer {
         revert("redeemer failed");
     }
 }
+
+/// @notice An RWA that re-enters the vault from inside its own transferFrom.
+contract ReentrantRwa is ERC20 {
+    address public vault;
+    bool public armed;
+
+    constructor() ERC20("Reentrant RWA", "rRWA", 18) {}
+
+    function mint(address to, uint256 amount) external {
+        _mint(to, amount);
+    }
+
+    function arm(address vault_) external {
+        vault = vault_;
+        armed = true;
+    }
+
+    bool public reentrySucceeded;
+    bytes public reentryError;
+
+    function transferFrom(address from, address to, uint256 amount) public override returns (bool) {
+        if (armed) {
+            armed = false;
+            (bool ok, bytes memory err) = vault.call(abi.encodeWithSignature("redeemRwa(uint256,uint256)", amount, 0));
+            reentrySucceeded = ok;
+            reentryError = err;
+        }
+        return super.transferFrom(from, to, amount);
+    }
+}

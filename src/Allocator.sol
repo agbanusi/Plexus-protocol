@@ -6,12 +6,13 @@ import {ERC4626} from "@solmate/tokens/ERC4626.sol";
 import {SafeTransferLib} from "@solmate/utils/SafeTransferLib.sol";
 import {FixedPointMathLib} from "@solmate/utils/FixedPointMathLib.sol";
 import {Owned} from "@solmate/auth/Owned.sol";
+import {ReentrancyGuard} from "@solmate/utils/ReentrancyGuard.sol";
 
 /// @notice Allocation layer inherited by every vault. Idle base asset is pushed into external
 /// ERC4626 vaults, which is what lets many vaults draw on the same liquidity base without
 /// each one needing its own dedicated pool. Targets are ERC4626 over the same base asset,
 /// so there is no adapter layer.
-abstract contract Allocator is Owned {
+abstract contract Allocator is Owned, ReentrancyGuard {
     using SafeTransferLib for ERC20;
     using FixedPointMathLib for uint256;
 
@@ -118,11 +119,11 @@ abstract contract Allocator is Owned {
         return total;
     }
 
-    function allocate(address target, uint256 assets) external onlyAllocator {
+    function allocate(address target, uint256 assets) external onlyAllocator nonReentrant {
         _allocate(target, assets);
     }
 
-    function deallocate(address target, uint256 assets) external onlyAllocator {
+    function deallocate(address target, uint256 assets) external onlyAllocator nonReentrant {
         _deallocate(target, assets);
     }
 

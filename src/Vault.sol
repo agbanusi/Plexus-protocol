@@ -134,7 +134,7 @@ contract Vault is ERC4626, Allocator {
     /* --------------------------- redemption --------------------------- */
 
     /// @notice Swap RWA for base asset instantly at the oracle price, less the fee.
-    function redeemRwa(uint256 rwaAmount, uint256 minBaseOut) external returns (uint256 baseOut) {
+    function redeemRwa(uint256 rwaAmount, uint256 minBaseOut) external nonReentrant returns (uint256 baseOut) {
         if (rwaAmount == 0) revert ZeroAmount();
 
         uint256 value = rwaValue(rwaAmount);
@@ -153,7 +153,12 @@ contract Vault is ERC4626, Allocator {
 
     /// @notice Push accumulated RWA into the redeemer. Settlement is not atomic and may take
     /// days, so the RWA stays on the books as `rwaInRedemption` until it is finalized.
-    function externalRedeem(bytes calldata data, uint256 value) external onlyOwner returns (bytes memory result) {
+    function externalRedeem(bytes calldata data, uint256 value)
+        external
+        onlyOwner
+        nonReentrant
+        returns (bytes memory result)
+    {
         if (redeemer == address(0)) revert NoRedeemer();
 
         uint256 before = rwa.balanceOf(address(this));
@@ -172,6 +177,7 @@ contract Vault is ERC4626, Allocator {
     function finalizeExternalRedeem(uint256 rwaAmount, bytes calldata data, uint256 value)
         external
         onlyOwner
+        nonReentrant
         returns (bytes memory result)
     {
         if (redeemer == address(0)) revert NoRedeemer();

@@ -7,7 +7,7 @@ import {Vault} from "../src/Vault.sol";
 import {Allocator} from "../src/Allocator.sol";
 import {Oracle} from "../src/Oracle.sol";
 import {IOracle} from "../src/interfaces/IOracle.sol";
-import {MockERC20, MockYieldVault, MockPriceFeed, MockRedeemer} from "./mocks/Mocks.sol";
+import {MockERC20, MockYieldVault, MockPriceFeed, MockRedeemer, ReentrantRwa} from "./mocks/Mocks.sol";
 
 contract VaultTest is Test {
     uint256 constant WAD = 1e18;
@@ -292,6 +292,36 @@ contract VaultTest is Test {
         vm.expectRevert("UNAUTHORIZED");
         vm.prank(lp);
         vault.externalRedeem(abi.encodeCall(MockRedeemer.pull, (1)), 0);
+    }
+
+    function test_redeemRwa_blocksReentrancy() public {
+        ReentrantRwa evil = new ReentrantRwa();
+        Vault evilVault = new Vault(owner, base, evil, IOracle(address(oracle)), "Evil", "EVL");
+
+        vm.startPrank(owner);
+        evilVault.setCaps(address(yieldVault), type(uint256).max, WAD);
+        evilVault.setLiquidityTarget(address(yieldVault));
+        evilVault.setParams(0.01e18, 1_000_000e6);
+        vm.stopPrank();
+
+        base.mint(lp, 1000e6);
+        vm.startPrank(lp);
+        base.approve(address(evilVault), 1000e6);
+        evilVault.deposit(1000e6, lp);
+        vm.stopPrank();
+
+        evil.mint(holder, 100e18);
+        evil.arm(address(evilVault));
+
+        vm.startPrank(holder);
+        evil.approve(address(evilVault), 100e18);
+        evilVault.redeemRwa(100e18, 0);
+        vm.stopPrank();
+
+        assertFalse(evil.reentrySucceeded(), "re-entrant redeemRwa must not go through");
+        assertEq(evil.reentryError(), abi.encodeWithSignature("Error(string)", "REENTRANCY"));
+        // The holder was paid exactly once.
+        assertEq(base.balanceOf(holder), 103.95e6);
     }
 
     /* ------------------------------ admin ------------------------------ */
